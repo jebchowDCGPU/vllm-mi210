@@ -1,4 +1,4 @@
-# vllm-mi210
+# fp8-anywhere
 
 **FP8 inference on AMD Instinct MI210 (gfx90a/CDNA2) — hardware that doesn't have FP8 matrix cores.**
 
@@ -27,7 +27,7 @@ The MI210 (gfx90a/CDNA2) has no FP8 matrix instructions — AMD introduced those
 
 ```bash
 # Prerequisites: MI210 (gfx90a), ROCm 7.2+, Docker, the base image
-# (local/vllm-mi210:mi210.6-aiter — built from davetha/mi210-vllm)
+# (local/fp8-anywhere:mi210.6-aiter — built from davetha/mi210-vllm)
 
 # 1. Place the model
 #    Qwen/Qwen3.8-27B-FP8 → /home/tai/models/qwen38-27b-fp8/
@@ -95,7 +95,7 @@ cd gemm-harness && ./bench-e2e.sh
 ## Credits
 
 - **davetha** — the base stack ([mi210-vllm](https://github.com/davetha/mi210-vllm), [mi210-llm-stack](https://github.com/davetha/mi210-llm-stack), [aiter-cdna2](https://github.com/davetha/aiter-cdna2))
-- **wu1w** — the anti-fork approach ([vllm-mi210](https://github.com/wu1w/vllm-mi210))
+- **wu1w** — the anti-fork approach ([fp8-anywhere](https://github.com/wu1w/fp8-anywhere))
 - **HyperQwen** ([syv-ai/HyperQwen](https://github.com/syv-ai/HyperQwen)) — draft-vocab truncation, sort-free sampler, probabilistic draft sampling
 - **rlrs** — AITER gfx90a attention PRs ([#4387](https://github.com/ROCm/aiter/pull/4387), [#4388](https://github.com/ROCm/aiter/pull/4388), [#4389](https://github.com/ROCm/aiter/pull/4389))
 

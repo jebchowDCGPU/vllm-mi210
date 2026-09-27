@@ -64,12 +64,6 @@ cd gemm-harness && ./bench-e2e.sh
 │   ├── verify.sh             #   Kernel gate (correctness + benchmark)
 │   ├── bench-e2e.sh          #   E2E benchmark (warmup + 6 prompts + acceptance)
 │   └── run-test.sh           #   One-command container test runner
-└── docs/
-    ├── GEMM_HANDOFF.md       #   Complete GEMM optimization guide
-    ├── FP8_HIP_KERNEL_GUIDE.md #  Guide for fixing paged_attention_v1 for FP8
-    ├── KERNEL_BENCHMARK.md   #   A/B benchmark results
-    ├── BRINGUP_LOG.md        #   Full session history (1.4 → 69 tok/s)
-    └── SCOUT_REPORT.md       #   Original research (model, hardware, community)
 ```
 
 ## Performance Ladder

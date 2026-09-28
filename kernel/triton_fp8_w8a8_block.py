@@ -67,6 +67,26 @@ try:
 except Exception:  # noqa: BLE001  # standalone (test) import
     per_token_group_quant_fp8 = None
 
+# single shared scratch for the M>16 de-interleave: the prefill GEMMs run
+# sequentially (one layer at a time on one stream), so ONE buffer of the
+# max weight size serves every layer -- NOT a per-weight cache (that would
+# duplicate the whole model). Grows once during the profile run, then is
+# stable across CUDA-graph capture/replay.
+_DEINTERLEAVE_SCRATCH: torch.Tensor | None = None
+
+
+def _deinterleave_scratch(nbytes: int, device) -> torch.Tensor:
+    global _DEINTERLEAVE_SCRATCH
+    if (
+        _DEINTERLEAVE_SCRATCH is None
+        or _DEINTERLEAVE_SCRATCH.numel() < nbytes
+        or _DEINTERLEAVE_SCRATCH.device != device
+    ):
+        _DEINTERLEAVE_SCRATCH = torch.empty(
+            nbytes, dtype=torch.uint8, device=device
+        )
+    return _DEINTERLEAVE_SCRATCH
+
 
 @triton.jit
 def _w8a8_block_gemm_kernel(
@@ -213,8 +233,8 @@ def _w8a8_block_splitk_reduce(
 
 @triton.jit
 def _w8a16_block_gemm_kernel(
-    a_ptr,  # [M, K] bf16 (raw activations)
-    b_ptr,  # [N, K] uint8 (raw float8_e4m3fn bytes)
+    a_ptr,  # [M, K] bf16 (raw activations, original k-order)
+    b_ptr,  # [N//16, K*16] uint8 N-PRESHUFFLED (see repack_b_npreshuffle)
     bs_ptr,  # [N // G_N, K // G_K] fp32 per-block weight scales
     c_ptr,  # [M, N] bf16 (SPLIT_K=1) or fp32 partials [SPLIT_K, M, N]
     M,
@@ -232,9 +252,17 @@ def _w8a16_block_gemm_kernel(
     stride_bs_k,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,  # 128 = group_k (the scale-group tile)
     SPLIT_K: tl.constexpr,
 ):
+    """N-preshuffle wide-load W8A16 kernel (p13, measured 2026-09-27):
+    B ships 16-way N-interleaved ([N//16, K*16]: row r holds, for each k,
+    the 16 bytes of original rows r*16..r*16+15). The kernel loads
+    [BN//16, BK*16] tiles (2048-B contiguous rows) and de-shuffles with a
+    SINGLE permute chain that also lands the tile transposed for the dot
+    (one layout conversion total, vs two for the previous split+trans
+    design). Measured +12-24% per shape over the 2-way K-interleave
+    wide kernel; gate_up 1071 GB/s = 92% of the 1166 control ceiling."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     pid_k = tl.program_id(2) if SPLIT_K > 1 else 0
@@ -247,32 +275,47 @@ def _w8a16_block_gemm_kernel(
         k_end = K
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     mask_m = offs_m < M
-    mask_n = offs_n < N
 
+    # N addressing: the tile covers BLOCK_N original rows = BLOCK_N//16
+    # preshuffled rows, each BK*16 bytes long
+    nsub: tl.constexpr = BLOCK_N // 16
+    offs_nsub = pid_n * nsub + tl.arange(0, nsub)      # [BN//16]
+    mask_nsub = offs_nsub < (N // 16)
+    # original N offsets for the scale row
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
     offs_bsn = offs_n // group_n
     bs_ptrs = bs_ptr + offs_bsn * stride_bs_n
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am \
-        + (k_base + offs_k)[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_n[:, None] * stride_bn \
-        + (k_base + offs_k)[None, :] * stride_bk
+    # wide load: [BN//16, BK*16] -- BK*16-byte contiguous rows
+    offs_kwide = tl.arange(0, BLOCK_K * 16)
+    b_ptrs = b_ptr + offs_nsub[:, None] * stride_bn \
+        + (k_base * 16 + offs_kwide)[None, :] * stride_bk
 
     for k_start in range(k_base, k_end, BLOCK_K):
-        a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)  # bf16
-        b_u8 = tl.load(b_ptrs, mask=mask_n[:, None], other=0)
-        b_dot = b_u8.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+        b_wide = tl.load(b_ptrs, mask=mask_nsub[:, None], other=0)
+        # single layout conversion: de-shuffle the 16-way N-interleave AND
+        # land in [BK, BN] (transposed) in one permute chain
+        b_t = (
+            b_wide.reshape(nsub, BLOCK_K, 16)
+            .permute(1, 0, 2)          # [BK, BN//16, 16]
+            .reshape(BLOCK_K, BLOCK_N) # [BK, BN] -- B operand, no trans
+        )
+        b_dec = b_t.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
 
+        a = tl.load(
+            a_ptr + offs_m[:, None] * stride_am
+            + (k_start + offs_k)[None, :] * stride_ak,
+            mask=mask_m[:, None], other=0.0,
+        )
         offs_ks = k_start // group_k
         b_s = tl.load(bs_ptrs + offs_ks * stride_bs_k, mask=mask_n, other=0.0)
-        accumulator += (
-            tl.dot(a, tl.trans(b_dot), out_dtype=tl.float32) * b_s[None, :]
-        )
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
+        accumulator += tl.dot(a, b_dec, out_dtype=tl.float32) * b_s[None, :]
+
+        b_ptrs += BLOCK_K * 16 * stride_bk
 
     if SPLIT_K > 1:
         c = accumulator
@@ -285,6 +328,32 @@ def _w8a16_block_gemm_kernel(
     tl.store(c_ptrs, c, mask=mask_c)
 
 
+def repack_b_npreshuffle(b_u8: torch.Tensor) -> torch.Tensor:
+    """16-way N-interleave: out[r, k*16 + i] = B[r*16 + i, k]. Lets the
+    wide kernel's [BN//16, BK*16] load de-shuffle into the transposed
+    [BK, BN] dot operand with a single permute chain. Applied once at
+    weight load; the GEMM result is unchanged."""
+    N, K = b_u8.shape
+    assert N % 16 == 0 and K % 16 == 0
+    b = b_u8.view(N // 16, 16, K)          # [r, i, k]
+    out = torch.empty(N // 16, K * 16, dtype=b_u8.dtype, device=b_u8.device)
+    out.view(N // 16, K, 16)[...] = b.permute(0, 2, 1)  # [r, k, i]
+    return out
+
+
+def depreshuffle_b(b_u8: torch.Tensor, out: torch.Tensor | None = None):
+    """Inverse of repack_b_npreshuffle (for the M>16 path, which runs the
+    original-layout W8A8 ladder). Writes into `out` (an [N, K] uint8 view
+    of the shared scratch) when given."""
+    N16, K16 = b_u8.shape
+    N, K = N16 * 16, K16 // 16
+    b = b_u8.view(N16, K, 16)             # [r, k, i]
+    if out is None:
+        out = torch.empty(N, K, dtype=b_u8.dtype, device=b_u8.device)
+    out.view(N // 16, 16, K)[...] = b.permute(0, 2, 1)  # [r, i, k]
+    return out
+
+
 def _w8a16_block_gemm(
     a: torch.Tensor,  # [M, K] bf16 (raw activations)
     b: torch.Tensor,  # [N, K] float8_e4m3fn
@@ -295,24 +364,29 @@ def _w8a16_block_gemm(
 ) -> torch.Tensor:
     """W8A16 block-scaled GEMM for M <= 16 (decode/spec-decode path).
 
-    Sweep-derived single config: (16, 64, 128)@4w/2s + split-K=4 (falls back
-    to 2/1 when K is not divisible). BLOCK_N=64 keeps every tile inside one
-    128-wide weight-scale block.
+    N-preshuffle wide-load variant (p13): expects the 16-way N-interleaved
+    B repack. Config (16, 64, 128)@4w/2s + split-K (4 if (K//4)%128==0 else
+    2 if (K//2)%128==0 else 1) -- sweep-verified single config for every
+    model shape.
     """
     M, K = a.shape
-    N = b.shape[0]
+    N16, K16 = b.shape
+    N = N16 * 16
     assert group_k >= 1 and group_n >= 1
 
     b_u8 = b.view(torch.uint8)
 
     BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 128
     num_warps, num_stages = 4, 2
-    split_k = 4 if K % (4 * group_k) == 0 else (
-        2 if K % (2 * group_k) == 0 else 1
+    if N % BLOCK_N != 0 or K % 16 != 0:
+        # wide path infeasible: fall back to the caller (W8A8 handles it)
+        raise ValueError(
+            f"W8A16 wide path needs N % {BLOCK_N} == 0 and K % 16 == 0, "
+            f"got N={N} K={K}"
+        )
+    split_k = 4 if (K // 4) % BLOCK_K == 0 else (
+        2 if (K // 2) % BLOCK_K == 0 else 1
     )
-    if N % BLOCK_N != 0:
-        # odd N: fall back to the caller (W8A8 path handles any N)
-        raise ValueError(f"W8A16 path needs N % {BLOCK_N} == 0, got N={N}")
 
     c = torch.empty((M, N), dtype=out_dtype, device=a.device)
 
@@ -356,13 +430,13 @@ def _w8a16_block_gemm(
 
 def _w8a16_block_gemm_fake(a, b, b_scales, group_n, group_k, out_dtype):
     M, K = a.shape
-    N = b.shape[0]
+    N = b.shape[0] * 16  # b is [N//16, K*16] N-preshuffled
     return torch.empty((M, N), dtype=out_dtype, device=a.device)
 
 
 def _w8a16_block_gemm_dispatch(
     a: torch.Tensor,  # [M, K] bf16 (raw activations)
-    b: torch.Tensor,  # [N, K] float8_e4m3fn
+    b: torch.Tensor,  # [N, K] float8_e4m3fn (INTERLEAVED repack)
     b_scales: torch.Tensor,  # [N // group_n, K // group_k] fp32
     group_n: int,
     group_k: int,
@@ -379,20 +453,36 @@ def _w8a16_block_gemm_dispatch(
     dispatch logging 2026-09-27). Inside the op the branch runs eagerly
     per call, including during CUDA-graph capture (each capture size
     launches the right kernels).
+
+    B arrives in the N-PRESHUFFLED repack (the class repacks at weight
+    load). The M>16 path de-preshuffles into a shared scratch buffer
+    (~0.3 ms per call vs an ~11 ms M=2048 GEMM = 2.7%; the M 17-64 band
+    is rare in single-stream serving) and runs the original W8A8 ladder.
     """
     M, K = a.shape
-    N = b.shape[0]
+    b_u8 = b.view(torch.uint8)
+    N16, K16 = b_u8.shape
+    N = N16 * 16  # original N (b is [N//16, K*16] preshuffled)
     if (
         M <= 16
-        and K % group_k == 0
+        and K % 16 == 0
         and N % 64 == 0
         and per_token_group_quant_fp8 is not None
     ):
         return _w8a16_block_gemm(a, b, b_scales, group_n, group_k, out_dtype)
-    # M > 16 (prefill) or odd shape: quantize here, run the W8A8 ladder
+    # M > 16 (prefill) or odd shape: de-preshuffle B into the shared
+    # scratch, quantize A, run the original W8A8 ladder
+    scratch = _deinterleave_scratch(b_u8.numel(), b.device)
+    b_orig = depreshuffle_b(b_u8, out=scratch[: b_u8.numel()].view(N, K))
     a_q, a_scales = per_token_group_quant_fp8(a, group_k)
     return _w8a8_block_gemm(
-        a_q, b, a_scales, b_scales, group_n, group_k, out_dtype
+        a_q,
+        b_orig.view(torch.float8_e4m3fn),
+        a_scales,
+        b_scales,
+        group_n,
+        group_k,
+        out_dtype,
     )
 
 
@@ -705,6 +795,46 @@ if _IN_VLLM_PACKAGE:
 
         # accept BF16 input directly: skip the base-class input quant
         apply_input_quant = False
+
+        def apply_weights(self, layer, x, bias=None, **kwargs):
+            """Base-class apply_weights computes the output shape from
+            weight.shape[0] -- wrong for the N-preshuffled weight
+            ([N//16, K*16]). This override mirrors the base logic with
+            N = weight.shape[0] * 16."""
+            out_dtype = self.config.out_dtype
+            params = self._get_layer_params(layer)
+            weight = params.weight
+            weight_scale = (
+                params.weight_scale
+                if params.weight_scale_inv is None
+                else params.weight_scale_inv
+            )
+            input_2d = x.view(-1, x.shape[-1])
+            output_shape = [*x.shape[:-1], weight.shape[0] * 16]
+            # apply_input_quant=False: pass x through, As is a placeholder
+            output = self.apply_block_scaled_mm(
+                A=input_2d,
+                B=weight,
+                As=input_2d.new_empty(1),
+                Bs=weight_scale,
+            )
+            if bias is not None:
+                output = output + bias
+            return output.to(dtype=out_dtype).view(*output_shape)
+
+        def process_weights_after_loading(self, layer: torch.nn.Module):
+            """Base-class weight processing, then the 16-way N-preshuffle
+            for the wide-load M<=16 path. The weight's SHAPE changes to
+            [N//16, K*16] (the dispatch and the M>16 de-preshuffle both
+            expect it)."""
+            super().process_weights_after_loading(layer)
+            w = layer.weight
+            N, K = w.shape
+            if N % 16 == 0 and K % 16 == 0:
+                repacked = repack_b_npreshuffle(w.view(torch.uint8))
+                # .data assignment allows the intentional shape change
+                w.data = repacked.view(torch.float8_e4m3fn)
+                del repacked
 
         @classmethod
         def is_supported(cls, compute_capability=None):

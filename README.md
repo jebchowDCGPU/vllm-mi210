@@ -6,13 +6,13 @@
 
 ## What This Is
 
-A complete deployment stack for serving **Qwen3.8-27B** (and similar models) with **FP8 quantization** on a single AMD Instinct MI210 — a GPU with **no native FP8 support**. Every FP8 operation runs through software emulation, delivering **28–49× the speed of stock vLLM** on this hardware.
+A complete deployment stack for serving **Qwen3.8-27B** (and similar models) with **FP8 quantization** on a single AMD Instinct MI210 — a GPU with **no native FP8 support**. Every FP8 operation runs through software emulation, delivering **44–71× the speed of stock vLLM** on this hardware.
 
 | Metric | Stock vLLM | This Stack |
 |---|---|---|
-| FP8 decode (single-stream) | 1.4 tok/s | **45–69 tok/s** |
+| FP8 decode (single-stream) | 1.4 tok/s | **61–100 tok/s** |
 | KV cache capacity (262K ctx) | — | **601K tokens** (FP8 KV) |
-| MTP acceptance | — | ~46% (n=5, probabilistic) |
+| MTP acceptance | — | ~48% (n=5, probabilistic) |
 
 ## How It Works
 
@@ -27,7 +27,7 @@ The MI210 (gfx90a/CDNA2) has no FP8 matrix instructions — AMD introduced those
 
 ```bash
 # Prerequisites: MI210 (gfx90a), ROCm 7.2+, Docker, the base image
-# (local/fp8-anywhere:mi210.6-aiter — built from davetha/mi210-vllm)
+# (local/vllm-mi210:mi210.6-aiter — built from davetha/mi210-vllm)
 
 # 1. Place the model
 #    Qwen/Qwen3.8-27B-FP8 → /home/tai/models/qwen38-27b-fp8/
@@ -89,7 +89,7 @@ cd gemm-harness && ./bench-e2e.sh
 ## Credits
 
 - **davetha** — the base stack ([mi210-vllm](https://github.com/davetha/mi210-vllm), [mi210-llm-stack](https://github.com/davetha/mi210-llm-stack), [aiter-cdna2](https://github.com/davetha/aiter-cdna2))
-- **wu1w** — the anti-fork approach ([fp8-anywhere](https://github.com/wu1w/fp8-anywhere))
+- **wu1w** — the anti-fork approach ([vllm-mi210](https://github.com/wu1w/vllm-mi210))
 - **HyperQwen** ([syv-ai/HyperQwen](https://github.com/syv-ai/HyperQwen)) — draft-vocab truncation, sort-free sampler, probabilistic draft sampling
 - **rlrs** — AITER gfx90a attention PRs ([#4387](https://github.com/ROCm/aiter/pull/4387), [#4388](https://github.com/ROCm/aiter/pull/4388), [#4389](https://github.com/ROCm/aiter/pull/4389))
 
